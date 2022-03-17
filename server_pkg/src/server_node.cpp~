@@ -1,0 +1,310 @@
+#include "ros/ros.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+
+/* Communication Class */
+class SubscribeAndPublish
+{
+public:
+
+private:
+    // Parameter initial values
+    float posX = 0.0;
+    float posY = 0.0;
+    float posT = 0.0;
+
+    // Quasi-constant variables (constant within one launch)
+    float heading_offset = 0.0;
+    float referenceLat = 0.0;
+    float referenceLon = 0.0;
+
+    // Variables to store last GNSS measurements
+    bool gnssUpdate = false;
+    float lastLat = 0.0;
+    float lastLon = 0.0;
+    float lastNvel = 0.0;
+    float lastEvel = 0.0;
+
+    // Variables to store last ODO measurements
+    float odoFrontLeft = 0.0; // w1
+    float odoFrontRight = 0.0; // w2
+    float odoRearLeft = 0.0; // w3
+    float odoRearRight  = 0.0; // w4
+    float odoAngleFront = 0.0;
+    float odoAngleRear = 0.0;
+
+    // Last locomotion timestamp
+    unsigned long lastTimestamp = 0;
+
+    // ZUPT variables
+    float stationaryHeading = 0.0;
+    bool stationary = true;
+    bool notMovedYet = true;
+
+    // Navigation class variable
+    UKF_nav navigation;
+
+    // ROS variables
+    // Although the subscribers are never actually used,
+    // Aparently you need them for you subscription to stay alive
+    ros::Subscriber locSub;
+    ros::Subscriber motSub;
+    ros::Subscriber gpsSub;
+    ros::Subscriber gpsvelSub;
+    ros::ServiceServer navRST;
+    ros::NodeHandle nh;
+    ros::Publisher navigationPub;
+    uint navMsgCount = 0; // used to lower nav msg publication frequency
+
+public:
+    SubscribeAndPublish() // This is the constructor
+    {
+
+			navigationPub = nh.advertise<rdk_msgs::navigation>("navigation_data2", 10);
+			motSub = nh.subscribe<rdk_msgs::motors>("/motors_data", 10, &SubscribeAndPublish::motors_callback, this);
+			locSub = nh.subscribe<rdk_msgs::locomotion>("/locomotion_data", 100, &SubscribeAndPublish::locomotion_callback, this);
+			gpsSub = nh.subscribe<sensor_msgs::NavSatFix>("gps_node/fix", 10, &SubscribeAndPublish::gnss_pos_callback, this);
+			gpsvelSub = nh.subscribe<geometry_msgs::TwistWithCovarianceStamped>("gps_node/fix_velocity", 10, &SubscribeAndPublish::gnss_vel_callback, this);
+			navRST = nh.advertiseService("/navigation/reset", &SubscribeAndPublish::navigation_reset, this);
+
+      // separate hande to HANDLE (get it?) parameter input
+	    ros::NodeHandle nh_private("~");
+      navMsgCount = 0;
+      nh_private.getParam("offset", heading_offset);
+    	heading_offset = pi2pi(heading_offset, 1); // second parameter is set to 'degrees'
+    	printf("Heading offset is set to: %f degrees.\n", heading_offset);
+    	printf("Use _offset:=[value] to change it.\n");
+
+    	posT = heading_offset * PI / 180.0;
+    	navigation = UKF_nav();
+    	navigation.ukf_init(posX, posY, posT, 0.0, 0.0);
+
+      printf("\nUKF is ready!\n");
+    }
+
+
+    bool navigation_reset(rdk_msgs::rokoRequest::Request& req, rdk_msgs::rokoRequest::Response& res)
+    {
+    	navMsgCount = 0;
+    	posT = heading_offset * PI / 180.0;
+    	posX = 0;
+    	posY = 0;
+    	navigation.ukf_init(posX, posY, posT, 0.0, 0.0);
+    	printf("\nNavigation stack has been reset!\n");
+    	return true;
+    }
+
+
+    float dtCalc(unsigned long timestamp)
+    {
+    	float dt = 0.0;
+    	if (lastTimestamp == 0)
+    	{
+    		dt = 0.005;
+    	}
+    	else
+    	{
+    		dt = (timestamp - lastTimestamp) / 1000.0;
+    		lastTimestamp = timestamp;
+    	}
+      return dt;
+    }
+
+
+    void ned2local(float nedCoord[2])
+    {
+      float localCoord[] = {0, 0};
+      float offset_rad =  heading_offset * PI / 180.0F;
+      localCoord[0] = nedCoord[0]*cos(offset_rad) + nedCoord[1]*sin(offset_rad);
+      localCoord[1] = - nedCoord[0]*sin(offset_rad) + nedCoord[1]*cos(offset_rad);
+      nedCoord[0] = localCoord[0];
+      nedCoord[1] = localCoord[1];
+    }
+
+    void publishSolution()
+    {
+      float coordTransform[] = {posX, posY};
+      ned2local(coordTransform);
+      float localHeading = pi2pi(posT - heading_offset * PI / 180.0, 0);
+
+      rdk_msgs::navigation msg;
+      msg.X = coordTransform[0];
+      msg.Y = coordTransform[1];
+      msg.heading = localHeading; // It would be logical to give out in degrees, but control node disagrees...
+      msg.lat = lastLat;
+      msg.lon = lastLon;
+      msg.lon0 = referenceLon;
+      msg.lat0 = referenceLat;
+      msg.offset = heading_offset;
+      // publish to /navigation_data topic
+      navigationPub.publish(msg);
+    }
+
+
+    void motors_callback(const rdk_msgs::motors msg)
+    {
+      //printf("motors callback\n");
+      // Odometer values have some noise, so we cut it
+      // out if value is too low.
+      if (fabs(msg.odo[0]) > 0.2F && fabs(msg.odo[0]) < 15) // w1
+        odoFrontLeft = msg.odo[0];
+      else
+        odoFrontLeft = 0.0F;
+      if (fabs(msg.odo[1]) > 0.2F && fabs(msg.odo[1]) < 15) // w2
+        odoFrontRight = msg.odo[1];
+      else
+        odoFrontRight = 0.0F;
+
+      if (fabs(msg.odoRear[0]) > 0.2F && fabs(msg.odoRear[0]) < 15) // w3
+        odoRearLeft = msg.odoRear[0];
+      else
+        odoRearLeft = 0.0F;
+      if (fabs(msg.odoRear[1]) > 0.2F && fabs(msg.odoRear[1]) < 15) // w4
+        odoRearRight = msg.odoRear[1];
+      else
+        odoRearRight = 0.0F;
+
+      odoAngleFront = msg.angleFront * PI / 180.0;
+      odoAngleRear = msg.angleRear * PI / 180.0;
+    }
+
+
+    void gnss_vel_callback(const geometry_msgs::TwistWithCovarianceStamped msg)
+    {
+      if ((fabs(msg.twist.twist.linear.x) < 15) && (fabs(msg.twist.twist.linear.y) < 15))
+      {
+        lastNvel = msg.twist.twist.linear.y;
+        lastEvel = msg.twist.twist.linear.x;
+      }
+    }
+
+
+    void gnss_pos_callback(const sensor_msgs::NavSatFix msg)
+    {
+      // GPS measuremenss come in degrees. But filter works with meters actually.
+      float newLat = msg.latitude;
+      float newLon = msg.longitude;
+      bool validCoordinates = false;
+      // This section contains hard coded geo coordinates limits.
+      // This was added to avoid HUGE jumps in geo positioning due to GPS errors.
+      // If using robot far away from Moscow - you might want to disable this.
+      if ((msg.latitude > 53) && (msg.latitude < 58) &&
+          (msg.longitude > 35) && (msg.longitude < 40))
+      {
+        validCoordinates = true;
+      }
+
+      if (validCoordinates && (msg.status.status >= 0) &&
+        (msg.latitude != 0) && (msg.longitude != 0))
+      {
+        // if lat0 or lon0 hasn't been set - reference point calculation
+        // is needed
+          bool referenceNeeded = false;
+        if ((referenceLat == 0) || (referenceLon == 0))
+        {
+          referenceNeeded = true;
+        }
+        if (referenceNeeded)
+        {
+          float xproj = -0.5 * cos(posT) - 0.00 * sin(posT);
+          float yproj = -0.5 * sin(posT) + 0.00 * cos(posT);
+          // Distance between referenceLat and newLat, calculated based on
+          // the distance robot has already travel (distance is measured by odometry)
+          float shiftLat = posX / 111111.1 - xproj / 111111.1;
+          // Distance between referenceLon and newLon
+          float shiftLon = posY / (111111.1*cos(newLat * PI / 180.0)) - yproj / (111111*cos(newLat * PI / 180.0));
+          // 1 geo degree equals to 111111 meters (approx.)
+          referenceLat = newLat - shiftLat;
+          referenceLon = newLon - shiftLon;
+        }
+
+        // replace last GEO coordinates
+        if (notMovedYet)
+        {
+          float xproj = -0.5 * cos(posT) - 0.00 * sin(posT);
+          float yproj = -0.5 * sin(posT) + 0.00 * cos(posT);
+          referenceLat = newLat - xproj / 111111.1;
+          referenceLon = newLon - yproj / (111111.1*cos(newLat * PI / 180.0));
+        }
+        else
+        {
+          lastLat = newLat;
+          lastLon = newLon;
+        }
+      }
+    }
+
+
+    void locomotion_callback(const rdk_msgs::locomotion msg)
+    {
+      //printf("locomotion callback\n");
+      float dt = dtCalc(msg.timestamp);
+      navigation.set_dt(dt);
+      float gyro = 0.0F;
+      if (odoFrontLeft != 0 || odoFrontRight != 0 || odoRearLeft != 0 || odoRearRight != 0)
+      {
+        notMovedYet = false;
+        gyro = - msg.angular_velocity[2];
+      }
+      if (lastLat != 0 && lastLon != 0)
+      {
+        gnssUpdate = true;
+      }
+      navigation.predict(odoAngleFront, odoAngleRear);
+      if (gnssUpdate)
+      {
+        float gps_x = (lastLat - referenceLat) * 111111.1;
+        float gps_y = (lastLon - referenceLon) * (111111.1 * cos(lastLat * PI / 180.0));
+        navigation.updateOGS(odoFrontLeft, odoFrontRight, odoRearLeft, odoRearRight,
+                             gyro, gps_x, gps_y, lastNvel, lastEvel);
+      }
+      else
+      {
+        navigation.updateOG(odoFrontLeft, odoFrontRight, odoRearLeft, odoRearRight, gyro);
+      }
+
+      float solution[] = {0, 0.2, 0.1};
+      navigation.get_solution(solution);
+      //printf("solution: %f %f %f \n", solution[0], solution[1], solution[2]);
+      //printf("\n");
+      posX = solution[0];
+      posY = solution[1];
+      posT = solution[2];
+
+      navMsgCount++;
+      if (navMsgCount % 20 == 0)
+      {
+        publishSolution();
+        printf("Solution published...\n");
+      }
+      if (gnssUpdate)
+      {
+        gnssUpdate = false;
+        lastLat = 0.0;
+        lastLon = 0.0;
+        lastEvel = 0.0;
+        lastNvel = 0.0;
+      }
+    }
+
+
+
+
+
+  };//End of class SubscribeAndPublish
+
+  int main(int argc, char** argv)
+  {
+  	ros::init(argc, argv, "server_node");
+
+
+
+	SubscribeAndPublish SAPObject;
+
+
+      ros::spin();
+
+  	return 0;
+  }
