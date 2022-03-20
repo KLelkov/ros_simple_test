@@ -26,6 +26,20 @@ Build all the packages inside "src" folder with a single command:
 ```
 catkin_make
 ```
+Check the path to the "catkin_ws" folder by using
+```
+pwd
+```
+Now you need to edit .bashrc file that contains instructions that are executed each time you open a new terminal window. 
+We need to source our freshly created ROS workspace. Lets open .bashrc first (editing it may require -su accsess, if thats the case - use sudo prefix)
+```
+nano ~/.bashrc
+```
+Scroll to the end of the file and add a new string
+```
+source [path_to_catkin_ws]/devel/setup.bash
+```
+Save and close the file.
 Thats it, you are ready to go!
 
 ## General case workspace setup
@@ -45,3 +59,22 @@ catkin_make
 Done.
 
 ## Running the code
+Alright, to run the basic client-server-client example from this repository you will need to open four terminal windows.
+In the first one - launch ROSCORE:
+```
+rocore
+```
+In the second window - run the server node:
+```
+rosrun server_pkg server_node
+```
+In the third window run the sensor client node:
+```
+rosrun client_pkg sensor_node 
+```
+You will see that the sensor will start sending measurements to the server.
+And in the last window run client node:
+```
+rosrun client_pkg client_node 
+```
+The client node will send one request to the server and receive any data the server sends back.
